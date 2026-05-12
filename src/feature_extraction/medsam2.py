@@ -31,7 +31,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # -----------------------------------------------------------------------------
 # Set hydra config paths
 # -----------------------------------------------------------------------------
-CONFIG_DIR = Path("/home/kmouheb/repos/africai/local/MedSAM2/config")
+CONFIG_DIR = Path("MedSAM2/config")
 GlobalHydra.instance().clear()
 
 # -----------------------------------------------------------------------------

@@ -24,7 +24,7 @@ torch.cuda.manual_seed_all(seed)
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-CONFIG_DIR = Path("/home/kmouheb/repos/africai/local/MedSAM2/config")
+CONFIG_DIR = Path("MedSAM2/config")
 
 
 # -----------------------------------------------------------------------------

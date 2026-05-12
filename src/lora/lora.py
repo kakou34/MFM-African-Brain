@@ -278,7 +278,7 @@ class MedSAM2Backbone(nn.Module):
         from hydra import initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
         from sam2.build_sam import build_sam2_video_predictor_npz
-        CONFIG_DIR = Path('/home/kmouheb/repos/africai/local/MedSAM2/config')
+        CONFIG_DIR = Path('MedSAM2/config')
         GlobalHydra.instance().clear()
         with initialize_config_dir(config_dir=str(CONFIG_DIR), job_name='sam2_lora'):
             predictor = build_sam2_video_predictor_npz(config_path, ckpt_path)
@@ -307,7 +307,7 @@ class MedicalSAM2Backbone(nn.Module):
         from hydra import initialize_config_dir
         from hydra.core.global_hydra import GlobalHydra
         from sam2.build_sam import build_sam2_video_predictor
-        CONFIG_DIR = Path('/home/kmouheb/repos/africai/local/MedSAM2/config')
+        CONFIG_DIR = Path('MedSAM2/config')
         GlobalHydra.instance().clear()
         with initialize_config_dir(config_dir=str(CONFIG_DIR), job_name='sam2_lora'):
             predictor = build_sam2_video_predictor(config_path, ckpt_path)
