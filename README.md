@@ -51,11 +51,11 @@ Download the checkpoints and place them in a directory of your choice (referred 
 
 | Model | Checkpoint file |
 |-------|----------------|
-| SAM-Med3D | bundled in `medim` package (auto-downloaded) |
-| BrainIAC | `BrainIAC.ckpt` |
-| 3D-DINO | `3dino_vit_weights.pth` |
-| MedSAM2 | `MedSAM2_latest.pt` |
-| MedicalSAM2 | `MedicalSAM2_pretrain.pth` |
+| [SAM-Med3D](https://github.com/uni-medical/sam-med3d) | bundled in `medim` package (auto-downloaded) |
+| [BrainIAC](https://github.com/AIM-KannLab/BrainIAC) | `BrainIAC.ckpt` |
+| [3D-DINO](https://github.com/AICONSlab/3DINO) | `3dino_vit_weights.pth` |
+| [MedSAM2](https://github.com/bowang-lab/MedSAM2) | `MedSAM2_latest.pt` |
+| [MedicalSAM2](https://github.com/ImprintLab/Medical-SAM2) | `MedicalSAM2_pretrain.pth` |
 
 ---
 
