@@ -146,23 +146,32 @@ def make_val_transforms():
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
-def seg_path_from_img(root: Path, img_relative: str, subject_id: str) -> Path:
-    return (root / img_relative).parent / f"{subject_id}-seg.nii.gz"
+def filter_valid_subjects(df: pd.DataFrame, seq: str) -> pd.DataFrame:
+    """Keep only subjects that have the requested sequence."""
+    valid = df[df["seq"] == seq]["subject_id"].unique()
+    return df[df["subject_id"].isin(valid) & (df["seq"] == seq)].copy()
 
 
-def build_datalist(df_subjects: pd.DataFrame, root: Path) -> list:
+def build_datalist(df_subjects: pd.DataFrame, root: Path, seq: str) -> list:
     records = []
-    for _, row in df_subjects.iterrows():
-        seg = seg_path_from_img(root, row["img"], row["subject_id"])
-        if not seg.exists():
-            print(f"  [skip] seg not found: {seg}")
+    for subject_id, grp in df_subjects.groupby("subject_id"):
+        mask_path = root / grp.iloc[0]["mask"]
+        if not mask_path.exists():
+            print(f"  [skip] {subject_id}: mask not found: {mask_path}")
             continue
-        img_path = str(root / row["img"])
+        seq_rows = grp[grp["seq"] == seq]
+        if seq_rows.empty:
+            print(f"  [skip] {subject_id}: missing seq '{seq}'")
+            continue
+        img_path = root / seq_rows.iloc[0]["img"]
+        if not img_path.exists():
+            print(f"  [skip] {subject_id}: image not found: {img_path}")
+            continue
         records.append({
-            "image":      img_path,
-            "label":      str(seg),
-            "subject_id": row["subject_id"],
-            "image_path": img_path,
+            "subject_id": str(subject_id),
+            "image":      str(img_path),
+            "label":      str(mask_path),
+            "image_path": str(img_path),
         })
     return records
 
@@ -263,13 +272,29 @@ def main(args):
         else:
             df["subject_id"] = df["id"]
 
-    df_seq = df[df["seq"] == args.seq].copy()
-    if df_seq.empty:
+    if args.seq not in df["seq"].unique():
         raise ValueError(
-            f"No rows with seq='{args.seq}'. "
+            f"Sequence '{args.seq}' not found in CSV. "
             f"Available: {df['seq'].unique().tolist()}"
         )
+
+    df_seq = filter_valid_subjects(df, args.seq)
+    if df_seq.empty:
+        raise ValueError(f"No subjects with seq='{args.seq}'.")
     print(f"Sequence '{args.seq}': {df_seq['subject_id'].nunique()} subjects")
+
+    # Extra training subjects (never used for testing)
+    df_extra_train = None
+    if args.extra_train_csv:
+        df_extra = pd.read_csv(args.extra_train_csv)
+        if "subject_id" not in df_extra.columns:
+            if df_extra["id"].str.contains("_").any():
+                df_extra["subject_id"] = df_extra["id"].str.rsplit("_", n=1).str[0]
+            else:
+                df_extra["subject_id"] = df_extra["id"]
+        df_extra_train = filter_valid_subjects(df_extra, args.seq)
+        n_extra = df_extra_train["subject_id"].nunique()
+        print(f"Extra training subjects: {n_extra}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -292,8 +317,17 @@ def main(args):
         df_train = df_seq[df_seq["subject_id"].isin(train_subjects)]
         df_test  = df_seq[df_seq["subject_id"].isin(test_subjects)]
 
-        train_list = build_datalist(df_train, root)
-        test_list  = build_datalist(df_test, root)
+        train_list = build_datalist(df_train, root, args.seq)
+        test_list  = build_datalist(df_test,  root, args.seq)
+
+        if df_extra_train is not None:
+            df_extra_split = df_extra_train[
+                ~df_extra_train["subject_id"].isin(test_subjects)
+            ]
+            extra_list = build_datalist(df_extra_split, root, args.seq)
+            print(f"  extra training subjects added: {len(extra_list)}")
+            train_list = train_list + extra_list
+
         print(f"  volumes with seg: train={len(train_list)}, test={len(test_list)}")
 
         train_ds = Dataset(data=train_list, transform=make_train_transforms())
@@ -334,11 +368,16 @@ def main(args):
             if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
                 print(f"  epoch {epoch+1:3d}/{args.epochs} | loss={train_loss:.4f}")
 
-        # Set up mask output directory for this split if requested
-        masks_dir = None
-        if args.split_idx is not None:
+        # Always save predictions for split 4; also save for a specific requested split
+        if split_idx == 3:
+            masks_dir = out_dir / "brainiac" / args.seq / f"split{split_idx + 1}"
+            masks_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  saving predictions → {masks_dir}")
+        elif args.split_idx is not None:
             masks_dir = out_dir / f"masks_split{split_idx + 1}"
             masks_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            masks_dir = None
 
         dice, iou, per_sub_dice, per_sub_iou, per_sample = evaluate(
             model, test_loader, masks_dir=masks_dir
@@ -395,6 +434,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--csv_path",        type=str, required=True,
                         help="CSV with columns: id, img, seq, label, [subject_id]")
+    parser.add_argument("--extra_train_csv", type=str, default=None,
+                        help="Optional CSV of extra subjects added only to the training loader")
     parser.add_argument("--root_dir",        type=str, required=True,
                         help="Root directory for image paths in the CSV")
     parser.add_argument("--out_dir",         type=str, required=True,

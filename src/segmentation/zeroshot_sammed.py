@@ -98,62 +98,88 @@ def unpad_and_upsample(pred_model, original_size):
 # -----------------------------------------------------------------------------
 # Inference
 # -----------------------------------------------------------------------------
-@torch.no_grad()
-def run_zero_shot(model, image_tensor, gt_mask_model, n_points=10):
-    """
-    Multi-click zero-shot inference using n_points random foreground samples.
-
-    model          : SAM_Med3D on DEVICE, eval mode
-    image_tensor   : (1, 1, 128, 128, 128) float32 on DEVICE
-    gt_mask_model  : (128, 128, 128) uint8 numpy  -- used to sample positive clicks
-    n_points       : number of foreground points to sample
-
-    Returns        : (128, 128, 128) uint8 numpy binary mask in model space.
-    """
-    # --- 1. image embedding ---
-    image_embeddings = model.image_encoder(image_tensor)  # (1, 384, 8, 8, 8)
-
-    # --- 2. sample n_points positive clicks from the GT ---
-    gt_t      = torch.from_numpy(gt_mask_model).to(DEVICE)   # (128,128,128)
-    fg_coords = torch.argwhere(gt_t > 0)                     # (N, 3)
-    if len(fg_coords) == 0:
-        return np.zeros((MODEL_SIZE,) * 3, dtype=np.uint8)
-
-    N = fg_coords.shape[0]
-    if N >= n_points:
-        idx = torch.randperm(N)[:n_points]
-    else:
-        idx = torch.randint(N, (n_points,))
-    point = fg_coords[idx].unsqueeze(0).float()              # (1, n_points, 3)
-    label = torch.ones(1, n_points, dtype=torch.int64, device=DEVICE)
-
-    # --- 3. empty low-res mask prompt (1, 1, 32, 32, 32) ---
-    prev_low_res = torch.zeros(
-        1, 1, MODEL_SIZE // 4, MODEL_SIZE // 4, MODEL_SIZE // 4, device=DEVICE
-    )
-
-    # --- 4. prompt encoder ---
+def _decode_mask(model, image_embeddings, pts, lbls):
+    """Single forward pass through prompt encoder + mask decoder. Returns (128,128,128) float32 logit map."""
     sparse_emb, dense_emb = model.prompt_encoder(
-        points=[point, label],
+        points=[pts.unsqueeze(0), lbls.unsqueeze(0)],
         boxes=None,
-        masks=prev_low_res,
+        masks=torch.zeros(1, 1, MODEL_SIZE // 4, MODEL_SIZE // 4, MODEL_SIZE // 4, device=DEVICE),
     )
-
-    # --- 5. mask decoder ---
     low_res_masks, _ = model.mask_decoder(
         image_embeddings=image_embeddings,
         image_pe=model.prompt_encoder.get_dense_pe(),
         sparse_prompt_embeddings=sparse_emb,
         dense_prompt_embeddings=dense_emb,
     )
-
-    # --- 6. upsample to model resolution, sigmoid, threshold ---
-    pred = F.interpolate(
-        low_res_masks, size=image_tensor.shape[-3:],
+    logits = F.interpolate(
+        low_res_masks, size=(MODEL_SIZE,) * 3,
         mode="trilinear", align_corners=False,
     )
-    pred = torch.sigmoid(pred)[0, 0].cpu().numpy()               # (128,128,128)
-    return (pred > 0.5).astype(np.uint8)
+    return torch.sigmoid(logits)[0, 0]  # (128,128,128) float32
+
+
+@torch.no_grad()
+def run_zero_shot(model, image_tensor, gt_mask_model, n_points=10):
+    """
+    Iterative prompting scheme from the SAM-Med3D paper:
+      1. Sample p₁ from foreground (positive click).
+      2. Run inference → Y.
+      3. For i=2..N: sample pᵢ from error region (FN ∪ FP),
+         assign positive label for FN, negative for FP,
+         re-run inference with all accumulated points.
+
+    model          : SAM_Med3D on DEVICE, eval mode
+    image_tensor   : (1, 1, 128, 128, 128) float32 on DEVICE
+    gt_mask_model  : (128, 128, 128) uint8 numpy  -- GT used for prompting
+    n_points       : total number of prompt points (1 initial + n_points-1 error-sampled)
+
+    Returns        : (128, 128, 128) uint8 numpy binary mask in model space.
+    """
+    image_embeddings = model.image_encoder(image_tensor)
+
+    gt_t      = torch.from_numpy(gt_mask_model).bool().to(DEVICE)  # (128,128,128)
+    fg_coords = torch.argwhere(gt_t)                                # (N_fg, 3)
+    if len(fg_coords) == 0:
+        return np.zeros((MODEL_SIZE,) * 3, dtype=np.uint8)
+
+    # Step 1: sample initial point from foreground
+    p1  = fg_coords[torch.randint(len(fg_coords), (1,))].float()   # (1, 3)
+    pts  = p1                                                        # (k, 3)
+    lbls = torch.ones(1, dtype=torch.int64, device=DEVICE)          # (k,)
+
+    pred_t = None
+
+    for i in range(n_points):
+        prob   = _decode_mask(model, image_embeddings, pts, lbls)   # (128,128,128)
+        pred_t = prob > 0.5                                          # bool tensor
+
+        if i == n_points - 1:
+            break
+
+        # Error region: FN (missed) ∪ FP (wrong)
+        fn_coords = torch.argwhere( gt_t & ~pred_t)
+        fp_coords = torch.argwhere(~gt_t &  pred_t)
+
+        if len(fn_coords) == 0 and len(fp_coords) == 0:
+            break  # perfect prediction
+
+        error_coords = torch.cat(
+            [c for c in (fn_coords, fp_coords) if len(c) > 0], dim=0
+        )
+        next_idx = torch.randint(len(error_coords), (1,))[0]
+        next_pt  = error_coords[next_idx].unsqueeze(0).float()       # (1, 3)
+        # FN → positive (1), FP → negative (0)
+        next_lbl = torch.tensor(
+            [1 if next_idx < len(fn_coords) else 0],
+            dtype=torch.int64, device=DEVICE,
+        )
+
+        pts  = torch.cat([pts,  next_pt],  dim=0)
+        lbls = torch.cat([lbls, next_lbl], dim=0)
+
+    if pred_t is None:
+        return np.zeros((MODEL_SIZE,) * 3, dtype=np.uint8)
+    return pred_t.cpu().numpy().astype(np.uint8)
 
 # -----------------------------------------------------------------------------
 # Metrics

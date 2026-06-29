@@ -60,11 +60,6 @@ def load_and_binarize(seg_path):
     return (arr > 0).astype(np.uint8)
 
 
-def seg_path_from_img(root, img_relative, subject_id):
-    img_dir = (root / img_relative).parent
-    return img_dir / f"{subject_id}-seg.nii.gz"
-
-
 # -----------------------------------------------------------------------------
 # Prompt generation
 # -----------------------------------------------------------------------------
@@ -90,19 +85,19 @@ def run_zero_shot(predictor, images, gt_mask, H_orig, W_orig):
     gt_mask   : (D, H_orig, W_orig) uint8 numpy - only used to derive the bbox prompt
     H_orig, W_orig : original slice dimensions (for coordinate normalisation)
 
-    Returns pred_mask (D, H_orig, W_orig) uint8 numpy.
+    Returns prob_mask (D, H_orig, W_orig) float32 numpy with sigmoid probabilities.
     """
-    pred_mask = np.zeros(gt_mask.shape, dtype=np.uint8)
+    prob_mask = np.zeros(gt_mask.shape, dtype=np.float32)
 
     # Pick the slice with the most GT tumour pixels as the prompt frame
     slice_areas = gt_mask.sum(axis=(1, 2))
     if slice_areas.max() == 0:
-        return pred_mask  # no tumour in GT → return empty
+        return prob_mask  # no tumour in GT → return empty
 
     prompt_frame = int(slice_areas.argmax())
     box = bbox_from_mask2d(gt_mask[prompt_frame])
     if box is None:
-        return pred_mask
+        return prob_mask
 
     with torch.inference_mode():
         state = predictor.init_state(
@@ -123,17 +118,17 @@ def run_zero_shot(predictor, images, gt_mask, H_orig, W_orig):
         for frame_idx, _, masks in predictor.propagate_in_video(
             state, start_frame_idx=prompt_frame
         ):
-            pred_mask[frame_idx] = (masks[0, 0].cpu().numpy() > 0).astype(np.uint8)
+            prob_mask[frame_idx] = torch.sigmoid(masks[0, 0]).cpu().numpy()
 
         # Backward: prompt_frame → first slice
         for frame_idx, _, masks in predictor.propagate_in_video(
             state, start_frame_idx=prompt_frame, reverse=True
         ):
-            pred_mask[frame_idx] = (masks[0, 0].cpu().numpy() > 0).astype(np.uint8)
+            prob_mask[frame_idx] = torch.sigmoid(masks[0, 0]).cpu().numpy()
 
         predictor.reset_state(state)
 
-    return pred_mask
+    return prob_mask
 
 
 # -----------------------------------------------------------------------------
@@ -183,10 +178,6 @@ def main(args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    masks_dir = Path(args.masks_dir) if args.masks_dir else None
-    if masks_dir:
-        masks_dir.mkdir(parents=True, exist_ok=True)
-
     # Load model
     GlobalHydra.instance().clear()
     with initialize_config_dir(config_dir=str(CONFIG_DIR), job_name="sam2"):
@@ -195,20 +186,18 @@ def main(args):
         )
     predictor.cuda().eval()
 
-    # Reproduce splits
-    # test_splits = get_test_splits(df)
-
-    # Run inference per subject × sequence
     records = []
     for subject_id, group in df.groupby("subject_id"):
         label = int(group["label"].iloc[0])
 
-        seg = seg_path_from_img(root, group["img"].iloc[0], subject_id)
-        if not seg.exists():
-            print(f"[skip] seg not found: {seg}")
+        mask_path = root / group["mask"].iloc[0]
+        if not mask_path.exists():
+            print(f"[skip] mask not found: {mask_path}")
             continue
-        gt_mask = load_and_binarize(seg)   # (D, H, W)
+        gt_mask = load_and_binarize(mask_path)  # (D, H, W)
         _, H_orig, W_orig = gt_mask.shape
+
+        prob_masks = {}  # seq -> (D, H, W) float32 probability map
 
         for _, row in group.iterrows():
             seq = row["seq"]
@@ -218,55 +207,45 @@ def main(args):
             volume = nib.load(img_path).get_fdata().transpose(2, 0, 1)  # (D,H,W)
             images = preprocess_volume(volume, target_size=args.target_size)
 
-            pred = run_zero_shot(predictor, images, gt_mask, H_orig, W_orig)
+            prob = run_zero_shot(predictor, images, gt_mask, H_orig, W_orig)
+            prob_masks[seq] = prob
+
+            pred = (prob > 0.5).astype(np.uint8)
             m = compute_metrics(pred, gt_mask)
-
-            if masks_dir is not None:
-                save_pred_nifti(
-                    pred, root / row["img"],
-                    masks_dir / f"{subject_id}_{seq}_pred.nii.gz",
-                )
-
             print(f"dice={m['dice']:.3f}  iou={m['iou']:.3f}")
-            records.append({
-                "subject_id": subject_id,
-                "seq": seq,
-                "label": label,
-                **m,
-            })
+            records.append({"subject_id": subject_id, "seq": seq, "label": label, **m})
+
+        if not prob_masks:
+            continue
+
+        # Combined mask: average probability across all sequences
+        avg_prob = np.mean(list(prob_masks.values()), axis=0)
+        combined_pred = (avg_prob > 0.5).astype(np.uint8)
+        m_comb = compute_metrics(combined_pred, gt_mask)
+        print(f"{subject_id} / combined  dice={m_comb['dice']:.3f}  iou={m_comb['iou']:.3f}")
+        records.append({"subject_id": subject_id, "seq": "combined", "label": label, **m_comb})
+
+        # Save FLAIR prediction
+        if args.flair_seq in prob_masks:
+            flair_rows = group[group["seq"] == args.flair_seq]
+            flair_img_path = root / flair_rows.iloc[0]["img"]
+            flair_dir = out_dir / args.model_name / args.flair_seq
+            flair_dir.mkdir(parents=True, exist_ok=True)
+            flair_pred = (prob_masks[args.flair_seq] > 0.5).astype(np.uint8)
+            save_pred_nifti(flair_pred, flair_img_path,
+                            flair_dir / f"{subject_id}_pred.nii.gz")
+
+        # Save combined prediction
+        combined_dir = out_dir / args.model_name / "combined"
+        combined_dir.mkdir(parents=True, exist_ok=True)
+        ref_img_path = root / group["img"].iloc[0]
+        save_pred_nifti(combined_pred, ref_img_path,
+                        combined_dir / f"{subject_id}_pred.nii.gz")
 
     df_scans = pd.DataFrame(records)
     scan_csv = out_dir / "per_scan_metrics.csv"
     df_scans.to_csv(scan_csv, index=False)
     print(f"\nSaved per-scan metrics → {scan_csv}")
-
-    # # Aggregate per split × sequence
-    # split_records = []
-    # for split_idx, test_subjects in enumerate(test_splits):
-    #     df_test = df_scans[df_scans["subject_id"].isin(test_subjects)]
-    #     for seq, grp in df_test.groupby("seq"):
-    #         split_records.append({
-    #             "split":      split_idx + 1,
-    #             "seq":        seq,
-    #             "n_subjects": len(grp),
-    #             "dice_mean":  grp["dice"].mean(),
-    #             "dice_std":   grp["dice"].std(),
-    #             "iou_mean":   grp["iou"].mean(),
-    #             "iou_std":    grp["iou"].std(),
-    #         })
-
-    # df_splits = pd.DataFrame(split_records)
-    # split_csv = out_dir / "split_metrics.csv"
-    # df_splits.to_csv(split_csv, index=False)
-    # print(f"Saved split metrics  → {split_csv}")
-
-    # summary = (
-    #     df_splits.groupby("seq")[["dice_mean", "iou_mean"]]
-    #     .agg(["mean", "std"])
-    #     .round(3)
-    # )
-    # print("\nSummary across splits:")
-    # print(summary)
 
 
 # -----------------------------------------------------------------------------
@@ -281,7 +260,9 @@ if __name__ == "__main__":
     parser.add_argument("--config_path",     type=str,
                         default="sam2.1_hiera_t512.yaml")
     parser.add_argument("--target_size",     type=int, default=512)
-    parser.add_argument("--masks_dir",       type=str, default=None,
-                        help="If set, save per-subject NIfTI predictions here as {subject}_{seq}_pred.nii.gz")
+    parser.add_argument("--model_name",      type=str, required=True,
+                        help="Model name used as a subdirectory in out_dir (e.g. sam2_tiny)")
+    parser.add_argument("--flair_seq",       type=str, default="t2f",
+                        help="Sequence name treated as FLAIR for saving predictions (default: t2f)")
     args = parser.parse_args()
     main(args)

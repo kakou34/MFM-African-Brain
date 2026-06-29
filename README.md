@@ -1,6 +1,6 @@
 # Can Medical Foundation Models Read the African Brain?
 
-This repository benchmarks medical vision foundation models for brain MRI **classification** and **tumour segmentation** on two African datasets: **NigerianBrain** (single-sequence T1) and **BraTS-Africa** (multi-sequence: T1c, T1n, T2-FLAIR, T2w). We evaluate five foundation models — SAM-Med3D, BrainIAC, 3D-DINO, MedSAM2, and MedicalSAM2 — under three adaptation regimes: linear probing, LoRA fine-tuning, and supervised fine-tuning with a decoder head.
+This repository benchmarks medical vision foundation models for brain MRI **classification** and **tumour segmentation** on two African datasets: **NigerianBrain** (single-sequence T1) and **BraTS-Africa** (multi-sequence: T1c, T1n, T2-FLAIR, T2w). We evaluate four foundation models — BrainIAC, 3D-DINO, MedSAM2, and MedicalSAM2 — under three adaptation regimes: linear probing, LoRA fine-tuning, and supervised fine-tuning with a decoder head.
 
 ---
 
@@ -51,7 +51,6 @@ Download the checkpoints and place them in a directory of your choice (referred 
 
 | Model | Checkpoint file |
 |-------|----------------|
-| [SAM-Med3D](https://github.com/uni-medical/sam-med3d) | bundled in `medim` package (auto-downloaded) |
 | [BrainIAC](https://github.com/AIM-KannLab/BrainIAC) | `BrainIAC.ckpt` |
 | [3D-DINO](https://github.com/AICONSlab/3DINO) | `3dino_vit_weights.pth` |
 | [MedSAM2](https://github.com/bowang-lab/MedSAM2) | `MedSAM2_latest.pt` |
@@ -127,11 +126,6 @@ python src/linear_probing/baseline.py \
 **Step 1 — Extract features:**
 
 ```bash
-# SAM-Med3D
-python src/feature_extraction/sammed.py \
-    --csv_path csvs/input/nigerianbrain.csv \
-    --root_dir $ROOT \
-    --save_path csvs/output/nigerianbrain/nigerianbrain_sammed.csv
 
 # BrainIAC
 python src/feature_extraction/brainiac.py \
@@ -193,12 +187,6 @@ Replace `sammed` with `brainiac`, `3dino`, `medsam2`, or `medicalsam2` for other
 LoRA adapters (rank 4) are added to the attention layers of the frozen image encoder, then a linear classifier is trained on top.
 
 ```bash
-# NigerianBrain — SAM-Med3D
-python src/lora/lora.py \
-    --model sammed \
-    --csv_path csvs/input/nigerianbrain.csv \
-    --root_dir $ROOT \
-    --output_csv csvs/results_lora/lora_nigerianbrain_sammed.csv
 
 # NigerianBrain — BrainIAC
 python src/lora/lora.py \
@@ -260,34 +248,6 @@ python src/segmentation/baseline.py \
 
 Run once per sequence (`t1c`, `t1n`, `t2f`, `t2w`) to benchmark all modalities.
 
----
-
-#### Zero-shot Segmentation — SAM-Med3D
-
-Point prompts are derived automatically from the ground-truth centroid; no training is performed.
-
-```bash
-python src/segmentation/zeroshot_sammed.py \
-    --csv_path csvs/input/bratsafrica.csv \
-    --root_dir $ROOT \
-    --out_dir  csvs/segmentation/sammed \
-    --num_points 10
-```
-
----
-
-#### SAM-Med3D with LoRA (segmentation fine-tuning)
-
-LoRA adapters are injected into the SAM-Med3D image encoder and fine-tuned end-to-end for tumour segmentation.
-
-```bash
-python src/segmentation/lora_sammed.py \
-    --csv_path csvs/input/bratsafrica.csv \
-    --root_dir $ROOT \
-    --out_dir  csvs/results_lora_seg \
-    --seq t2f \
-    --epochs 50 --batch_size 2 --lr 1e-4 --num_workers 8
-```
 
 ---
 

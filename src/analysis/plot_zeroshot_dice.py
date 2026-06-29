@@ -1,7 +1,8 @@
 """
-Box plots of per-scan Dice for zero-shot segmentation models across all sequences,
-with individual subject scores overlaid as jittered points.
-Models: SAM-Med3D (10 pts), MedSAM2, MedicalSAM2.
+Violin plots of per-scan Dice for MedSAM2 and MedicalSAM2 on BraTS Africa and EGD,
+for 'combined' and 'T2-FLAIR' sequences, with individual subject scores overlaid.
+One subplot per model; violins within each subplot are grouped by sequence and
+coloured by dataset.
 
 Usage:
     python plot_zeroshot_dice.py [--out figures/zeroshot_dice.pdf]
@@ -13,95 +14,117 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 
-SEG = Path("csvs/segmentation")
+RESULTS_ROOT = Path("path/to/DATA")
 
-MODELS = [
-    ("SAM-Med3D", SEG / "sammed_10pts/per_scan_metrics.csv"),
-    ("MedSAM2",            SEG / "medsam2/per_scan_metrics.csv"),
-    ("MedicalSAM2",        SEG / "medicalsam2/per_scan_metrics.csv"),
+DATASETS = [
+    ("BraTS-Africa", "BraTS-Africa"),
+    ("EGD-150",          "EGD"),
 ]
 
-SEQS       = ["t1c", "t1n", "t2f", "t2w"]
-SEQ_LABELS = ["T1Gd", "T1w", "T2-FLAIR", "T2w"]
+MODELS = [
+    ("MedSAM2",     "medsam2"),
+    ("Medical-SAM2", "medicalsam2"),
+]
+
+SEQS       = ["combined", "t2f"]
+SEQ_LABELS = ["Combined", "FLAIR"]
 
 # Okabe-Ito palette — perceptually uniform and print-safe
-COLORS = ["#0072B2", "#009E73", "#D55E00"]
+COLORS = ["#66c2a5", "#fc8d62"]   # one colour per dataset
 
-BOX_W   = 0.22   # width of each box
-GROUP_W = 0.60   # total width reserved per sequence group (tighter within group)
+BOX_W   = 0.22
+GROUP_W = 0.50
 
 
-def main(args):
-    # Load all per-scan dice values: {model_name: {seq: np.ndarray}}
-    data = {}
-    for name, path in MODELS:
-        df = pd.read_csv(path)
-        data[name] = {seq: df.loc[df["seq"] == seq, "dice"].values for seq in SEQS}
+def load_data(dataset_dir, model_dir):
+    path = RESULTS_ROOT / dataset_dir / "Results" / model_dir / "per_scan_metrics.csv"
+    df = pd.read_csv(path)
+    return {seq: df.loc[df["seq"] == seq, "dice"].values for seq in SEQS}
 
-    n_models = len(MODELS)
-    n_seqs   = len(SEQS)
-    rng      = np.random.default_rng(42)
 
-    # Centre positions for each sequence group
-    group_x  = np.arange(n_seqs, dtype=float)
-    offsets  = np.linspace(-GROUP_W / 2 + BOX_W / 2,
-                            GROUP_W / 2 - BOX_W / 2,
-                            n_models)
+def draw_panel(ax, model_data, offsets, group_x, ylabel=False):
+    """Draw one panel for a single model; violins grouped by sequence, coloured by dataset."""
+    rng = np.random.default_rng(42)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    legend_handles = []
-
-    for i, (name, _) in enumerate(MODELS):
+    for i, (ds_label, _) in enumerate(DATASETS):
         color = COLORS[i]
         positions = group_x + offsets[i]
+        vals_per_seq = [model_data[ds_label][seq] for seq in SEQS]
 
-        vals_per_seq = [data[name][seq] for seq in SEQS]
-
-        bp = ax.boxplot(
+        parts = ax.violinplot(
             vals_per_seq,
             positions=positions,
             widths=BOX_W * 0.85,
-            patch_artist=True,
-            notch=False,
-            showfliers=False,       # we draw the points ourselves
-            medianprops=dict(color="white", linewidth=2),
-            boxprops=dict(facecolor=color, alpha=0.55, linewidth=0.8),
-            whiskerprops=dict(linewidth=0.8, color=color),
-            capprops=dict(linewidth=0.8, color=color),
-            zorder=3,
+            showmedians=True,
+            showextrema=True,
         )
 
-        # Jittered strip of individual points
+        for body in parts["bodies"]:
+            body.set_facecolor(color)
+            body.set_alpha(0.6)
+            body.set_edgecolor(color)
+            body.set_linewidth(0.8)
+            body.set_zorder(5)
+
+        parts["cmedians"].set_color("black")
+        parts["cmedians"].set_linewidth(2)
+        parts["cmedians"].set_zorder(4)
+        for key in ("cmins", "cmaxes", "cbars"):
+            parts[key].set_color(color)
+            parts[key].set_linewidth(0.8)
+            parts[key].set_zorder(5)
+
         jitter_w = BOX_W * 0.30
         for pos, vals in zip(positions, vals_per_seq):
             jitter = rng.uniform(-jitter_w, jitter_w, size=len(vals))
-            ax.scatter(
-                pos + jitter, vals,
-                s=5, color=color, alpha=0.45,
-                linewidths=0, zorder=4,
-            )
+            ax.scatter(pos + jitter, vals, s=5, color=color, alpha=0.95,
+                       linewidths=0, zorder=3)
 
-        # One proxy patch for the legend
-        from matplotlib.patches import Patch
-        legend_handles.append(Patch(facecolor=color, alpha=0.75, label=name))
-
-    ax.set_ylabel("Dice score", fontsize=12)
+    if ylabel:
+        ax.set_ylabel("Dice score", fontsize=14)
     ax.set_ylim(-0.02, 1.08)
     ax.yaxis.set_major_locator(mticker.MultipleLocator(0.2))
     ax.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))
     ax.yaxis.grid(True, which="major", linestyle="--", linewidth=0.7, alpha=0.55, zorder=0)
     ax.set_axisbelow(True)
-
     ax.set_xticks(group_x)
-    ax.set_xticklabels(SEQ_LABELS, fontsize=12)
+    ax.set_xticklabels(SEQ_LABELS, fontsize=14)
     ax.tick_params(axis="x", length=0)
-
     ax.spines[["top", "right"]].set_visible(False)
 
-    fig.legend(handles=legend_handles, fontsize=10, framealpha=0.9,
-               loc="lower center", ncol=n_models, bbox_to_anchor=(0.5, 0.0))
+
+def main(args):
+    # all_data[ds_label][model_label][seq] = np.ndarray of dice scores
+    all_data = {ds_label: {} for ds_label, _ in DATASETS}
+    for ds_label, ds_dir in DATASETS:
+        for model_label, model_dir in MODELS:
+            all_data[ds_label][model_label] = load_data(ds_dir, model_dir)
+
+    # Restructure to model_data[model_label][ds_label][seq]
+    model_data = {
+        model_label: {ds_label: all_data[ds_label][model_label] for ds_label, _ in DATASETS}
+        for model_label, _ in MODELS
+    }
+
+    group_x = np.arange(len(SEQS), dtype=float)
+    offsets = np.linspace(-GROUP_W / 2 + BOX_W / 2,
+                           GROUP_W / 2 - BOX_W / 2,
+                           len(DATASETS))
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5), sharey=True)
+
+    for ax, (model_label, _) in zip(axes, MODELS):
+        draw_panel(ax, model_data[model_label], offsets, group_x, ylabel=(ax is axes[0]))
+        ax.set_title(model_label, fontsize=13, fontweight="bold")
+
+    legend_handles = [
+        Patch(facecolor=COLORS[i], alpha=0.75, label=ds_label)
+        for i, (ds_label, _) in enumerate(DATASETS)
+    ]
+    fig.legend(handles=legend_handles, fontsize=14, framealpha=0.9,
+               loc="lower center", ncol=len(DATASETS), bbox_to_anchor=(0.5, 0.0))
     plt.tight_layout(rect=[0, 0.08, 1, 1])
 
     out = Path(args.out)
@@ -113,5 +136,5 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="figures/zeroshot_dice.pdf")
+    parser.add_argument("--out", default="figures/zeroshot_dice_violin.pdf")
     main(parser.parse_args())

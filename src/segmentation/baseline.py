@@ -7,7 +7,9 @@ import random
 import argparse
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
+from scipy.ndimage import zoom as nd_zoom
 import pandas as pd
 import torch
 import monai
@@ -25,7 +27,6 @@ from monai.networks.nets import UNet
 from monai.transforms import (
     Compose,
     EnsureTyped,
-    LambdaD,
     LoadImaged,
     NormalizeIntensityd,
     ResizeWithPadOrCropd,
@@ -48,10 +49,10 @@ IMAGE_SIZE = (128, 128, 128)
 
 # ── Model ──────────────────────────────────────────────────────────────────────
 
-def build_model():
+def build_model(in_channels: int = 1):
     return UNet(
         spatial_dims=3,
-        in_channels=1,
+        in_channels=in_channels,
         out_channels=1,
         channels=(32, 64, 128, 256, 512),
         strides=(2, 2, 2, 2),
@@ -61,10 +62,6 @@ def build_model():
 
 
 # ── Transforms ─────────────────────────────────────────────────────────────────
-
-def _binarize(x):
-    return (x > 0).float()
-
 
 def make_train_transforms():
     return Compose([
@@ -76,7 +73,6 @@ def make_train_transforms():
         ResizeWithPadOrCropd(keys=["image", "label"],
                              spatial_size=IMAGE_SIZE, mode="constant"),
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
-        LambdaD(keys=["label"], func=_binarize),
         EnsureTyped(keys=["image", "label"], dtype=torch.float32),
     ])
 
@@ -91,27 +87,52 @@ def make_val_transforms():
         ResizeWithPadOrCropd(keys=["image", "label"],
                              spatial_size=IMAGE_SIZE, mode="constant"),
         NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
-        LambdaD(keys=["label"], func=_binarize),
         EnsureTyped(keys=["image", "label"], dtype=torch.float32),
     ])
 
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
-def seg_path_from_img(root: Path, img_relative: str, subject_id: str) -> Path:
-    return (root / img_relative).parent / f"{subject_id}-seg.nii.gz"
+def filter_valid_subjects(df: pd.DataFrame, seqs: list) -> pd.DataFrame:
+    """Keep only subjects that have all requested sequences."""
+    counts = (
+        df[df["seq"].isin(seqs)]
+        .groupby("subject_id")["seq"]
+        .apply(lambda x: all(s in x.values for s in seqs))
+    )
+    valid = counts[counts].index
+    return df[df["subject_id"].isin(valid) & df["seq"].isin(seqs)].copy()
 
 
-def build_datalist(df_subjects: pd.DataFrame, root: Path) -> list:
+def build_datalist(df_subjects: pd.DataFrame, root: Path, seqs: list) -> list:
     records = []
-    for _, row in df_subjects.iterrows():
-        seg = seg_path_from_img(root, row["img"], row["subject_id"])
-        if not seg.exists():
-            print(f"  [skip] seg not found: {seg}")
+    for subject_id, grp in df_subjects.groupby("subject_id"):
+        mask_path = root / grp.iloc[0]["mask"]
+        if not mask_path.exists():
+            print(f"  [skip] {subject_id}: mask not found: {mask_path}")
             continue
+
+        img_paths, skip = [], False
+        for seq in seqs:
+            seq_rows = grp[grp["seq"] == seq]
+            if seq_rows.empty:
+                print(f"  [skip] {subject_id}: missing seq '{seq}'")
+                skip = True
+                break
+            img_path = root / seq_rows.iloc[0]["img"]
+            if not img_path.exists():
+                print(f"  [skip] {subject_id}: image not found: {img_path}")
+                skip = True
+                break
+            img_paths.append(str(img_path))
+        if skip:
+            continue
+
         records.append({
-            "image": str(root / row["img"]),
-            "label": str(seg),
+            "subject_id": str(subject_id),
+            "image":      img_paths[0] if len(seqs) == 1 else img_paths,
+            "label":      str(mask_path),
+            "image_path": img_paths[0],
         })
     return records
 
@@ -144,7 +165,7 @@ def compute_metrics(pred: np.ndarray, gt: np.ndarray):
     return float(dice), float(iou)
 
 
-# ── Training / evaluation ──────────────────────────────────────────────────────
+# ── Training / evaluation / saving ────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, criterion, scaler):
     model.train()
@@ -181,6 +202,37 @@ def evaluate(model, loader):
     return np.mean(all_dice), np.mean(all_iou), all_dice, all_iou
 
 
+@torch.no_grad()
+def save_predictions(model, loader, save_dir: Path):
+    """Run inference, compute metrics, and save binary masks as NIfTI files."""
+    model.eval()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    all_dice, all_iou = [], []
+    for batch in loader:
+        x  = batch["image"].to(DEVICE)
+        gt = batch["label"].cpu().numpy()[:, 0]
+
+        logits = sliding_window_inference(x, IMAGE_SIZE, 1, model, overlap=0.5)
+        preds  = (torch.sigmoid(logits)[:, 0].cpu().numpy() > 0.5).astype(np.uint8)
+
+        subject_ids = batch["subject_id"]
+        image_paths = batch["image_path"]
+
+        for i in range(preds.shape[0]):
+            d, iou = compute_metrics(preds[i], (gt[i] > 0).astype(np.uint8))
+            all_dice.append(d)
+            all_iou.append(iou)
+
+            orig = nib.load(image_paths[i])
+            factors = tuple(o / p for o, p in zip(orig.shape[:3], preds[i].shape))
+            resampled = nd_zoom(preds[i].astype(np.float32), factors, order=0)
+            nib.save(
+                nib.Nifti1Image(resampled.astype(np.uint8), orig.affine, orig.header),
+                str(save_dir / f"{subject_ids[i]}_pred.nii.gz"),
+            )
+    return np.mean(all_dice), np.mean(all_iou), all_dice, all_iou
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main(args):
@@ -192,21 +244,27 @@ def main(args):
         else:
             df["subject_id"] = df["id"]
 
-    df_seq = df[df["seq"] == args.seq].copy()
-    if df_seq.empty:
+    missing_seqs = [s for s in args.seqs if s not in df["seq"].unique()]
+    if missing_seqs:
         raise ValueError(
-            f"No rows with seq='{args.seq}'. "
+            f"Sequences not found in CSV: {missing_seqs}. "
             f"Available: {df['seq'].unique().tolist()}"
         )
-    print(f"Sequence '{args.seq}': {df_seq['subject_id'].nunique()} subjects")
 
+    df_filtered = filter_valid_subjects(df, args.seqs)
+    if df_filtered.empty:
+        raise ValueError(f"No subjects with all sequences {args.seqs}.")
+    n_subjects = df_filtered["subject_id"].nunique()
+    print(f"Sequences {args.seqs}: {n_subjects} subjects with all seqs")
+
+    in_channels = len(args.seqs)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     root = Path(args.root_dir)
 
     criterion = DiceCELoss(sigmoid=True, lambda_dice=0.5, lambda_ce=0.5).to(DEVICE)
 
-    splits = get_splits(df_seq)
+    splits = get_splits(df_filtered)
     split_records = []
 
     for split_idx, (train_subjects, test_subjects) in enumerate(splits):
@@ -214,11 +272,11 @@ def main(args):
         print(f"Split {split_idx+1}/5  |  "
               f"train={len(train_subjects)}  test={len(test_subjects)}")
 
-        df_train = df_seq[df_seq["subject_id"].isin(train_subjects)]
-        df_test  = df_seq[df_seq["subject_id"].isin(test_subjects)]
+        df_train = df_filtered[df_filtered["subject_id"].isin(train_subjects)]
+        df_test  = df_filtered[df_filtered["subject_id"].isin(test_subjects)]
 
-        train_list = build_datalist(df_train, root)
-        test_list  = build_datalist(df_test, root)
+        train_list = build_datalist(df_train, root, args.seqs)
+        test_list  = build_datalist(df_test,  root, args.seqs)
         print(f"  volumes with seg: train={len(train_list)}, test={len(test_list)}")
 
         train_ds = Dataset(data=train_list, transform=make_train_transforms())
@@ -234,7 +292,7 @@ def main(args):
             num_workers=args.num_workers, collate_fn=list_data_collate,
         )
 
-        model = build_model().to(DEVICE)
+        model = build_model(in_channels=in_channels).to(DEVICE)
         print(f"  trainable params: {sum(p.numel() for p in model.parameters()):,}")
 
         optimizer = torch.optim.AdamW(
@@ -251,14 +309,20 @@ def main(args):
             if (epoch + 1) % 10 == 0 or epoch == args.epochs - 1:
                 print(f"  epoch {epoch+1:3d}/{args.epochs} | loss={train_loss:.4f}")
 
-        dice, iou, per_sub_dice, per_sub_iou = evaluate(model, test_loader)
+        if split_idx == 3:
+            seq_tag = "_".join(args.seqs)
+            pred_dir = out_dir / "baseline" / seq_tag / f"split{split_idx + 1}"
+            print(f"  saving predictions → {pred_dir}")
+            dice, iou, per_sub_dice, per_sub_iou = save_predictions(model, test_loader, pred_dir)
+        else:
+            dice, iou, per_sub_dice, per_sub_iou = evaluate(model, test_loader)
         print(f"  Split {split_idx+1} → "
               f"dice={dice:.3f} ± {np.std(per_sub_dice):.3f} | "
               f"iou={iou:.3f}  ± {np.std(per_sub_iou):.3f}")
 
         split_records.append({
             "split":     split_idx + 1,
-            "seq":       args.seq,
+            "seqs":      "+".join(args.seqs),
             "n_train":   len(train_list),
             "n_test":    len(test_list),
             "dice_mean": dice,
@@ -292,8 +356,8 @@ if __name__ == "__main__":
                         help="Root directory for image paths in the CSV")
     parser.add_argument("--out_dir",     type=str, required=True,
                         help="Output directory for metrics CSV")
-    parser.add_argument("--seq",         type=str, default="t2f",
-                        help="Sequence to train on (default: t2f)")
+    parser.add_argument("--seqs",        type=str, nargs="+", default=["t2f"],
+                        help="Sequence(s) to train on; multiple → multi-channel input (default: t2f)")
     parser.add_argument("--epochs",      type=int, default=50)
     parser.add_argument("--batch_size",  type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=8)
